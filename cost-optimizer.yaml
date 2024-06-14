@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'This CloudFormation template creates a Lambda function that executes monthly WorkSpaces running mode changes and publishes the results to an SNS topic.'
+
+# Template Parameters
+Parameters:
+
+# Amazon WorkSpaces usage threshold
+  UsageThreshold:
+    Type: Number
+    Description: 'Monthly usage threshold in hours used to determine the most efficient running mode for a WorkSpace.'
+    Default: 80
+
+# SNS Topic ARN
+  SNSTopicARN:
+    Type: String
+    Description: 'SNS Topic ARN to publish monthly updates on WorkSpaces running mode changes.'
+    Default: arn:aws:sns:us-west-2:564102503701:WorkSpacesRunningModeChanges
+
+# Template Resources
+Resources:
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "LambdaExecutionPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: "Allow"
+                Action:
+                  - "workspaces:DescribeWorkspaces"
+                  - "workspaces:ModifyWorkspaceProperties"
+                  - "sns:Publish"
+                  - "cloudwatch:GetMetricStatistics"
+                Resource: "*"
+
+  LambdaFunction:
+    Type: "AWS::Lambda::Function"
+    DependsOn: LambdaExecutionRole
+    Properties:
+      FunctionName: 'ws-automation-lambda-change-running-mode'
+      Handler: "index.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+
+          UsageThreshold = os.environ['UsageThreshold']
+          SNSTopicARN = os.environ['SNSTopicARN']
+
+          def get_monthly_usage(workspace_id):
+              # Configure the CloudWatch client
+              cloudwatch_client = boto3.client('cloudwatch')
+
+              # Get the current date and the date 30 days ago
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(days=30)
+
+              # Get CloudWatch metrics for the UserConnected metric of the WorkSpace
+              response = cloudwatch_client.get_metric_statistics(
+                  Namespace='AWS/WorkSpaces',
+                  MetricName='UserConnected',
+                  Dimensions=[
+                      {
+                          'Name': 'WorkspaceId',
+                          'Value': workspace_id
+                      },
+                  ],
+                  StartTime=start_time,
+                  EndTime=end_time,
+                  Period=3600,  # 1 hour period (3600 seconds)
+                  Statistics=['Maximum']  # Get the maximum of the values (1.0 or 0.0)
+              )
+
+              # Calculate the cumulative usage of the last 30 days in hours
+              total_UserConnected_hours = 0
+              for data_point in response['Datapoints']:
+                  total_UserConnected_hours += data_point['Maximum'] # Add the hours where the user was connected
+
+              print(f"WorkspaceId: {workspace_id}, TotalUserConnectedHours: {total_UserConnected_hours}")
+              return total_UserConnected_hours
+
+          def update_running_mode(workspace_id, new_running_mode):
+              # The logic to update the running mode of the WorkSpace with workspace_id goes here
+              # Use the AWS SDK for Python (boto3) to interact with the Amazon WorkSpaces API
+              workspaces_client = boto3.client('workspaces')
+              print(f"{workspace_id} changed to {new_running_mode}")
+              workspaces_client.modify_workspace_properties(
+                  WorkspaceId=workspace_id,
+                  WorkspaceProperties={
+                      'RunningMode': new_running_mode
+                  }
+              )
+          
+          def lambda_handler(event, context):
+              # Initialize lists to store converted WorkSpaces
+              converted_to_always_on = []
+              converted_to_auto_stop = []
+
+              # Get the WorkSpaces information
+              workspaces_client = boto3.client('workspaces')
+              response = workspaces_client.describe_workspaces()
+              workspaces = response['Workspaces']
+
+              # Iterate over the WorkSpaces to verify and update the running mode
+              for workspace in workspaces:
+                  workspace_id = workspace['WorkspaceId']
+                  username = workspace['UserName']
+                  running_mode = workspace['WorkspaceProperties']['RunningMode']
+                  usage_hours = get_monthly_usage(workspace_id)
+                  
+                  if running_mode == 'AUTO_STOP' and usage_hours > float(UsageThreshold):
+                      update_running_mode(workspace_id, 'ALWAYS_ON')
+                      converted_to_always_on.append(f"{workspace_id} ({username})")
+                  elif running_mode == 'ALWAYS_ON' and usage_hours < UsageThreshold:
+                      update_running_mode(workspace_id, 'AUTO_STOP')
+                      converted_to_auto_stop.append(workspace_id)
+
+              # Send report by email through SNS
+              sns_client = boto3.client('sns')
+
+              # Define the base message before the if-else block
+              report_message = "Dear WorkSpaces Administrator,\nThis is your monthly WorkSpaces running mode change report.\n\n"
+
+              if converted_to_always_on or converted_to_auto_stop:
+                  # Add specific information if there were changes in running modes
+                  if converted_to_always_on:
+                      report_message += f"— The following WorkSpaces have been changed to ALWAYS_ON: {', '.join(converted_to_always_on)}\n\n"
+                  
+                  if converted_to_auto_stop:
+                      report_message += f"— The following WorkSpaces have been changed to AUTO_STOP: {', '.join(converted_to_auto_stop)}\n\n"
+              else:
+                  # Add message if there were no changes in running modes
+                  report_message += "— No WorkSpaces running modes were changed.\n\n"
+
+              # Add final message after the if-else block
+              report_message += "If you have any questions or concerns, please contact AWS Support.\nSincerely, Your WorkSpaces Team"
+
+              # Publish the message
+              sns_client.publish(
+                  TopicArn=SNSTopicARN,
+                  Message=report_message,
+                  Subject="WorkSpaces Running Mode Change Report"
+              )
+
+      Runtime: "python3.8"
+      Timeout: 300
+      Environment:
+        Variables:
+          UsageThreshold: !Ref UsageThreshold
+          SNSTopicARN: !Ref SNSTopicARN
+
+  LambdaScheduledEvent:
+    Type: "AWS::Events::Rule"
+    Properties:
+      ScheduleExpression: "cron(0 23 L * ? *)"
+      Description: "Run Lambda almost at midnight on the last day of the month"
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: "TargetFunctionV1"
+      State: "ENABLED"
+
+  LambdaInvokePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt LambdaScheduledEvent.Arn

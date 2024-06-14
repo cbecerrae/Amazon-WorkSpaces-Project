@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'This CloudFormation template creates an S3 bucket and a Lambda Function that retrieves information about WorkSpaces and publishes it to a CSV file in the S3 bucket each hour for later retrieval by QuickSight.'
+
+# Template Resources
+Resources:
+  WorkspacesReportBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: "workspaces-report-bucket-181017"
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "LambdaExecutionPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${WorkspacesReportBucket}"
+                  - !Sub "arn:aws:s3:::${WorkspacesReportBucket}/*"
+              - Effect: "Allow"
+                Action:
+                  - "workspaces:DescribeWorkspaces"
+                  - "cloudwatch:GetMetricStatistics"
+                Resource: "*"
+
+  LambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: 'ws-automation-lambda-csv-report'
+      Handler: "index.lambda_handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import os
+          from io import StringIO
+          from datetime import datetime, timedelta
+
+          def lambda_handler(event, context):
+              # Configure WorkSpaces client
+              workspaces_client = boto3.client('workspaces')
+              
+              # Obtain information about the WorkSpaces
+              response = workspaces_client.describe_workspaces()
+              workspaces = response['Workspaces']
+              
+              # Create a CSV file in memory
+              output = StringIO()
+              writer = csv.writer(output)
+              writer.writerow(['workspace_id', 'user', 'usage', 'running_mode', 'state'])
+              
+              # Write data to the CSV
+              for workspace in workspaces:
+                  workspace_id = workspace['WorkspaceId']
+                  user = workspace['UserName']
+                  usage = get_monthly_usage(workspace_id)  # Función personalizada para obtener el uso
+                  running_mode = workspace['WorkspaceProperties']['RunningMode']
+                  state = workspace['State']
+                  writer.writerow([workspace_id, user, usage, running_mode, state])
+              
+              # Upload the CSV file to S3
+              s3_client = boto3.client('s3')
+              bucket_name = os.environ['S3_BUCKET']
+              s3_client.put_object(Bucket=bucket_name, Key='workspaces_report.csv', Body=output.getvalue())
+          
+          def get_monthly_usage(workspace_id):
+              # Configure the CloudWatch client
+              cloudwatch_client = boto3.client('cloudwatch')
+
+              # Get the current date and the date 30 days ago
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(days=30)
+
+              # Get CloudWatch metrics for the UserConnected metric of the WorkSpace
+              response = cloudwatch_client.get_metric_statistics(
+                  Namespace='AWS/WorkSpaces',
+                  MetricName='UserConnected',
+                  Dimensions=[
+                      {
+                          'Name': 'WorkspaceId',
+                          'Value': workspace_id
+                      },
+                  ],
+                  StartTime=start_time,
+                  EndTime=end_time,
+                  Period=3600,  # 1-hour period (3600 seconds)
+                  Statistics=['Maximum']  # Get the maximum of the values (1.0 or 0.0)
+              )
+
+              # Calculate the cumulative usage of the last 30 days in hours
+              total_UserConnected_hours = 0
+              for data_point in response['Datapoints']:
+                  total_UserConnected_hours += data_point['Maximum'] # Sum the hours where the user was connected
+
+              print(f"WorkspaceId: {workspace_id}, TotalUserConnectedHours: {total_UserConnected_hours}")
+              return total_UserConnected_hours
+
+      Runtime: "python3.8"
+      Timeout: 300
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref WorkspacesReportBucket
+
+  LambdaScheduledEvent:
+    Type: "AWS::Events::Rule"
+    Properties:
+      ScheduleExpression: "cron(0 * * * ? *)" 
+      Description: "Run the Lambda function each hour"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: "TargetFunctionV1"
+
+  LambdaInvokePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref LambdaFunction
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt LambdaScheduledEvent.Arn
